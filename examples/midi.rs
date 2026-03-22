@@ -1,12 +1,12 @@
 use midly::{MidiMessage, Smf, TrackEventKind};
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::{Consumer, Observer, Producer, Split}};
 use bus::{Bus, BusReader};
-use surge_rs::EasySurge;
+use surge_rs::synthesizer::EasySurge;
 
 use std::{thread::{self}, time::{self, Duration}};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-const MIDI: &[u8] = include_bytes!("waydrive.mid");
+const MIDI: &[u8] = include_bytes!("./data/waydrive.mid");
 
 struct Event {
     time: u32,

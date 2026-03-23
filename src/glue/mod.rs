@@ -8,6 +8,7 @@ pub mod hell_ffi;
 pub mod hcode;
 pub mod synthesizer;
 pub mod parameter;
+pub mod patch;
 
 /*
  * this is my cat:

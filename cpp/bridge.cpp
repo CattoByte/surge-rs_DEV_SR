@@ -20,8 +20,23 @@ EXP	SurgeSynthesizer* create_engine(float sr) {
 		return surge;
 	}
 
+EXP	SurgePatch* create_patch() {
+		SurgeStorage::SurgeStorageConfig sconf;
+		sconf.scanWavetableAndPatches = false;
+		sconf.createUserDirectory = false;
+
+		auto* storage = new SurgeStorage(sconf);
+		auto* patch = new SurgePatch(storage);
+
+		return patch;
+	}
+
 EXP	void destroy_engine(SurgeSynthesizer* surge) {
 		if (surge) delete surge;	// this just works?
+	}
+
+	void destroy_patch(SurgePatch* patch) {
+		if (patch) delete patch;
 	}
 
 	// TODO: check if below and above even need the if.

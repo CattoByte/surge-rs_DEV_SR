@@ -9,6 +9,9 @@ keywords = ["audio", "synthesis", "api", "ffi"]
 categories = ["multimedia::audio", "api-bindings", "external-ffi-bindings"]
 exclude = ["/sbmod"]
 
+[dependencies]
+xml = "1.2.1"
+
 [dev-dependencies]
 textplots = "0.8.7"
 cpal = "0.17.3"

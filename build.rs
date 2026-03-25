@@ -1,4 +1,5 @@
-use std::{collections::HashSet, env, path::{Path, PathBuf}};
+use std::{collections::HashSet, env::var, path::{Path, PathBuf}};
+use bindgen::callbacks::{DiscoveredItem, DiscoveredItemId, ItemInfo};
 use git2::build::CheckoutBuilder;
 
 use {bindgen, serde_json, shell_words, cmake, cc, git2};
@@ -12,6 +13,15 @@ macro_rules! realprint {
 macro_rules! fakeprint {
     ($($tokens:tt)*) => {
         println!("\x1b[1;36m[SRS] =>\x1b[0m {}", format!($($tokens)*));
+    }
+}
+
+macro_rules! linksearchlink {
+    ($bpath:expr, $(($search:expr, $link:expr)),* $(,)?) => {
+        $(
+            println!("cargo:rustc-link-search=native={}", $bpath.clone() + "/build/" + $search);
+            println!("cargo:rustc-link-lib=static={}", $link);
+        )*
     }
 }
 
@@ -89,7 +99,8 @@ fn sm_update_rec(repo: &git2::Repository) {
     }
 }
 
-fn pull_surge_from_clouds(dst: &Path) {
+fn pull_surge_from_clouds(dst: impl AsRef<Path>) {
+    let dst = dst.as_ref();
     if dst.exists() {
         if git2::Repository::open(dst).unwrap().head().is_ok() {
             realprint!("surge is down from the clouds. no action.");
@@ -108,9 +119,6 @@ fn pull_surge_from_clouds(dst: &Path) {
     let mut checkout = CheckoutBuilder::new();
     callbacks.transfer_progress(|p| pct_callback(&mut counter, p));
     checkout.progress(|p, c, t| chk_callback(p, c, t));
-        //.sideband_progress(|txt| { println!("{:?}", txt); true})
-        //.pack_progress(|_, d2, d3| println!("{}\t{}", d2, d3))
-
 
     let mut fopts = git2::FetchOptions::new();
     fopts.depth(1).remote_callbacks(callbacks).prune(git2::FetchPrune::On);
@@ -128,97 +136,116 @@ fn pull_surge_from_clouds(dst: &Path) {
     let repo = git2::Repository::open(dst).expect("somehow couldn't crack open the surge.");
     sm_update_rec(&repo);
     realprint!("surge is ready.");
-
 }
+
+fn build_surge_from_ground(src: impl AsRef<Path>) -> PathBuf {
+    cmake::Config::new(src)
+        .define("SURGE_SKIP_JUCE_FOR_RACK", "ON")
+        .define("SURGE_SKIP_VST3", "ON")
+        .define("SURGE_SKIP_ALSA", "ON")
+        .define("SURGE_SKIP_STANDALONE", "ON")
+        .define("SURGE_SKIP_LUA", "ON")
+        .define("CMAKE_EXPORT_COMPILE_COMMANDS", "ON")
+        .define("ENABLE_LTO", "OFF")
+        .build()
+}
+
+const SDST_OT: &str = "sbmod/surge";    // i kind of forgot what this acronym stood for.
+const SDST_IT: &str = "../../../";      // the surge in surge/src/surge-rs/surge-rs.
 
 #[derive(Debug)]
-struct NoSystemHeaders;
+struct BindReporter;
 
-impl bindgen::callbacks::ParseCallbacks for NoSystemHeaders {
-    fn include_file(&self, filename: &str) {
-        if filename.contains("surge") && filename.ends_with("src/") {
-            println!("cargo:rerun-if-changed={}", filename);
-        }
+impl bindgen::callbacks::ParseCallbacks for BindReporter {
+    fn header_file(&self, filename: &str) { fakeprint!("{: <12}{}", "HEADER:", filename); }
+    fn include_file(&self, filename: &str) { fakeprint!("{: <12}{}", "INCLUDE:", filename); }
+    fn read_env_var(&self, key: &str) { fakeprint!("{: <12}{}", "ENV:", key); }
+    fn new_item_found(&self, id: DiscoveredItemId, item: DiscoveredItem) {
+        //let nfnon = "...".to_string();  // "name for no original name."
+        let get_id = |x: DiscoveredItemId|
+            format!("{:?}", x).trim_start_matches("DiscoveredItemId(").trim_end_matches(")").parse::<usize>().unwrap();
+
+        let packed = match item {
+            //DiscoveredItem::Struct { original_name, final_name }    => (original_name.unwrap_or("???".to_string()), final_name),
+            //DiscoveredItem::Union { original_name, final_name }     => (original_name.unwrap_or("???".to_string()), final_name),
+            DiscoveredItem::Alias { alias_name, alias_for }         => Some((format!("ALIAS OF {:0>6}", get_id(alias_for)).to_string(), alias_name)),
+            //DiscoveredItem::Enum { final_name }                     => (nfnon, final_name),
+            //DiscoveredItem::Function { final_name }                 => (nfnon, final_name),
+            DiscoveredItem::Method { final_name, parent }           => Some((format!("CHILD OF {:0>6}", get_id(parent)).to_string(), final_name)),
+            _                                                       => None,
+        };
+        if let Some((from, to)) = packed { fakeprint!("ID {:0>6} => {} -> {: >60}]", get_id(id), from, to); }
     }
+    /*fn item_name(&self, item_info: ItemInfo) -> Option<String> {
+        let kind = match item_info.kind {
+            bindgen::callbacks::ItemKind::Module    => "MOD",
+            bindgen::callbacks::ItemKind::Type      => "TYP",
+            bindgen::callbacks::ItemKind::Function  => "FUN",
+            bindgen::callbacks::ItemKind::Var       => "VAR",
+            _                                       => "???",
+        };
+        fakeprint!("{}:\t{}", kind, item_info.name);
+        None
+    }*/
+    /*fn generated_name_override(&self, item_info: ItemInfo) -> Option<String> {
+        self.item_name(item_info);
+        None
+    }*/
 }
 
+// okay. let's use some comments to keep our minds fresh.
 fn main() {
+    // rerun this entire script if any of these files change.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=cpp");
+    println!("cargo:rerun-if-changed=wrapper.h");
+
+    // set build and source paths for surge, depending on build mode.
     // TODO: allow custom directory or keep tree mode?
-    let (spath, bpath) = if env::var("CARGO_FEATURE_IN_SURGE_TREE").is_ok() {
+    let sdst_ot = SDST_OT.to_string();
+    let sdst_it = SDST_IT.to_string();
+    let (spath, bpath) = if var("CARGO_FEATURE_IN_SURGE_TREE").is_ok() {
         realprint!("feature \"in-surge-tree\" enabled. using parent directories.");
-        ("../../..".to_string(), "../../..".to_string())
+        (sdst_it.clone(), sdst_it)
     } else {
         realprint!("feature \"in-surge-tree\" disabled. pulling surge.");
-        let sdst = "sbmod/surge".to_string();
-        pull_surge_from_clouds(&Path::new(&sdst));
-        let bdst = cmake::Config::new(&sdst)
-            .define("SURGE_SKIP_JUCE_FOR_RACK", "ON")
-            .define("SURGE_SKIP_VST3", "ON")
-            .define("SURGE_SKIP_ALSA", "ON")
-            .define("SURGE_SKIP_STANDALONE", "ON")
-            .define("SURGE_SKIP_LUA", "ON")
-            .define("CMAKE_EXPORT_COMPILE_COMMANDS", "ON")
-            .define("ENABLE_LTO", "OFF")
-            //.profile("Debug")
-            //.cxxflag("-fno-function-sections")
-            //.cxxflag("-fno-data-sections")
-            //.cxxflag("-Wl,--no-gc-sections")
-            //.cxxflag("--verbose")
-            .build();
-        (sdst, String::from(bdst.to_str().unwrap()))
-    }.to_owned();
+        pull_surge_from_clouds(&sdst_ot);
+        let bdst = build_surge_from_ground(&sdst_ot);
+        (sdst_ot, bdst.to_string_lossy().to_string())   // why do i have to do this dance?...
+    };
 
-    println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=cpp");
+    linksearchlink!(bpath,
+        ("src/common",                              "surge-common"),
+        ("src/lua",                                 "surge-lua-src"),
+        ("libs/zstd/build/cmake/lib",               "zstd"),
+        ("libs/sqlite-3.23.3",                      "sqlite"),
+        ("libs/oddsound-mts",                       "oddsound-mts"),
+        ("libs/fmt",                                if var("OPT_LEVEL").unwrap() != "0" { "fmt" } else { "fmtd" }), // why.
+        ("libs/pffft",                              "pffft"),
+        ("libs/eurorack",                           "eurorack"),
+        ("libs/binn",                               "binn"),
+        ("libs/airwindows",                         "airwindows"),
+        ("libs/sst/sst-plugininfra",                "sst-plugininfra"),
+        ("libs/sst/sst-plugininfra/libs/strnatcmp", "strnatcmp"),
+        ("libs/sst/sst-plugininfra/libs/tinyxml",   "tinyxml"),
+    );
+    if var("CARGO_FEATURE_IN_SURGE_TREE").is_ok() { println!("cargo:rustc-link-lib=static=surge-common-binary"); }
 
-    // i know.
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/src/common");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/src/lua");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/zstd/build/cmake/lib");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/sqlite-3.23.3");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/oddsound-mts");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/fmt");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/pffft");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/eurorack");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/binn");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/airwindows");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/sst/sst-plugininfra");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/sst/sst-plugininfra/libs/strnatcmp");
-    println!("cargo:rustc-link-search=native={}", bpath.clone() + "/build/libs/sst/sst-plugininfra/libs/tinyxml");
-    println!("cargo:rustc-link-lib=static=surge-lua-src");
-    println!("cargo:rustc-link-lib=static=surge-common");
-    if env::var("CARGO_FEATURE_IN_SURGE_TREE").is_ok() { println!("cargo:rustc-link-lib=static=surge-common-binary"); }
-    println!("cargo:rustc-link-lib=static=zstd");
-    println!("cargo:rustc-link-lib=static=sqlite");
-    println!("cargo:rustc-link-lib=static=oddsound-mts");
-    println!("cargo:rustc-link-lib=static={}", if env::var("OPT_LEVEL").unwrap() != "0" { "fmt" } else { "fmtd" });  // why.
-    println!("cargo:rustc-link-lib=static=pffft");
-    println!("cargo:rustc-link-lib=static=eurorack");
-    println!("cargo:rustc-link-lib=static=binn");
-    println!("cargo:rustc-link-lib=static=airwindows");
-    println!("cargo:rustc-link-lib=static=sst-plugininfra");
-    println!("cargo:rustc-link-lib=static=strnatcmp");
-    println!("cargo:rustc-link-lib=static=tinyxml");
+    realprint!("peeking into surge's build flags.");
+    let comcom = bpath.clone() + "/build/compile_commands.json";    // "compile commands". comcom.
+    let json = std::fs::read_to_string(&comcom).expect("failed to read comcom!");
+    let coms: serde_json::Value = serde_json::from_str(&json).expect("failed to parse comcom!");
 
-    println!("cargo:rerun-if-changed=cpp/bridge.cpp");
-    println!("cargo:rerun-if-changed=cpp/bridge.h");
     realprint!("gathering bridge materials.");
     let mut bbuild = cc::Build::new();
     bbuild
         .warnings(false)
         .cpp(true)
         .std("c++20")
-        //.opt_level(0)
         .include(spath.clone())
-	.flag("-fno-char8_t")          // read ahead. this has to go here too...
-        //.flag("-fno-function-sections")
-        //.flag("-fno-data-sections")
-        //.flag("-Wl,--no-gc-sections")
-        //.flag("-fvisibility=default")
-        //.flag("--verbose")
+	.flag("-fno-char8_t")               // read ahead. this has to go here too...
         .file("cpp/bridge.cpp");
 
-    println!("cargo:rerun-if-changed={}", spath.clone() + "/src" );
     realprint!("searching for what the glue should bind.");
     let mut bindings = bindgen::Builder::default()
         .header("wrapper.h")
@@ -243,13 +270,9 @@ fn main() {
         .allowlist_item("Surge.*")          // fix for everything else (the nuclear option).
         .allowlist_item(".*idFor.*")        // fix for functions i need (unexported).
         .allowlist_item(".*Storage.*")      // fix for surge storage (most stuff).
-        .allowlist_item(".*State.*");       // fix for surge storage (other stuff).
-        //.parse_callbacks(Box::new(bindgen::CargoCallbacks::new().rerun_on_header_files(false)));
-    
-    realprint!("peeking into surge's build flags.");
-    let comcom = bpath.clone() + "/build/compile_commands.json";    // "compile commands". comcom.
-    let json = std::fs::read_to_string(&comcom).expect("failed to read comcom!");
-    let coms: serde_json::Value = serde_json::from_str(&json).expect("failed to parse comcom!");
+        .allowlist_item(".*State.*")        // fix for surge storage (other stuff).
+        .emit_ir_graphviz("graph.dot")
+        .parse_callbacks(Box::new(BindReporter));
 
     // get and use all the include paths from the configure.
     let mut unique = HashSet::new();
@@ -269,7 +292,7 @@ fn main() {
     for flag in tempvec {
         fakeprint!("new flag: {}", flag);
         bbuild.flag(&flag);
-        bindings = bindings.clone().clang_arg(&flag);
+        bindings = bindings.clone().clang_arg(&flag);   // is this not, like, bad or something?
     }
 
     realprint!("bridge is being built. please hold.");
@@ -278,10 +301,10 @@ fn main() {
     println!("cargo:rustc-link-lib=static=bridge");
 
     realprint!("generating bindings. please hold so i can make the glue.");
-    let bindings = bindings.generate().expect("unable to generate surge bindings");
-    let storehere = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let storehere = PathBuf::from(var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings
-        .write_to_file(storehere.join("bindings.rs"))
-        .expect("couldn't write bindings.");
+        .generate().expect("unable to generate surge bindings")
+        .write_to_file(storehere).expect("couldn't write bindings.");
+
     realprint!("all done!");
 }

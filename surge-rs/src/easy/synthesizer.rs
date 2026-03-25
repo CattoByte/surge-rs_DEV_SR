@@ -1,3 +1,4 @@
+#![allow(unused_imports)]   // i want the staircase!
 use crate::glue;
 use glue::hcode;
 use glue::hell_ffi;

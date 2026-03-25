@@ -1,18 +1,18 @@
 use std::{collections::HashSet, env::var, path::{Path, PathBuf}};
-use bindgen::callbacks::{DiscoveredItem, DiscoveredItemId, ItemInfo};
+use bindgen::callbacks::{DiscoveredItem, DiscoveredItemId};
 use git2::build::CheckoutBuilder;
 
-use {bindgen, serde_json, shell_words, cmake, cc, git2};
+use {bindgen, serde_json, shell_words, cmake, git2};
 // ^ here to easily check if they go unused.
 
 macro_rules! realprint {
     ($($tokens:tt)*) => {
-        println!("\x1b[1;32m[SRS] =>\x1b[0m {}", format!($($tokens)*));
+        println!("\x1b[1;32m[SRS-SYS] =>\x1b[0m {}", format!($($tokens)*));
     }
 }
 macro_rules! fakeprint {
     ($($tokens:tt)*) => {
-        println!("\x1b[1;36m[SRS] =>\x1b[0m {}", format!($($tokens)*));
+        println!("\x1b[1;36m[SRS-SYS] =>\x1b[0m {}", format!($($tokens)*));
     }
 }
 
@@ -150,7 +150,7 @@ fn build_surge_from_ground(src: impl AsRef<Path>) -> PathBuf {
         .build()
 }
 
-const SDST_OT: &str = "sbmod/surge";    // i kind of forgot what this acronym stood for.
+const SDST_OT: &str = "sbmod/surge/";   // i kind of forgot what this acronym stood for.
 const SDST_IT: &str = "../../../";      // the surge in surge/src/surge-rs/surge-rs.
 
 #[derive(Debug)]
@@ -174,7 +174,7 @@ impl bindgen::callbacks::ParseCallbacks for BindReporter {
             DiscoveredItem::Method { final_name, parent }           => Some((format!("CHILD OF {:0>6}", get_id(parent)).to_string(), final_name)),
             _                                                       => None,
         };
-        if let Some((from, to)) = packed { fakeprint!("ID {:0>6} => {} -> {: >60}]", get_id(id), from, to); }
+        if let Some((from, to)) = packed { fakeprint!("ID {:0>6} => {} -> {: >65}]", get_id(id), from, to); }
     }
     /*fn item_name(&self, item_info: ItemInfo) -> Option<String> {
         let kind = match item_info.kind {
@@ -196,8 +196,8 @@ impl bindgen::callbacks::ParseCallbacks for BindReporter {
 // okay. let's use some comments to keep our minds fresh.
 fn main() {
     // rerun this entire script if any of these files change.
-    println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=cpp");
+    println!("cargo:rerun-if-changed=cpp/plumber.h");           // the plumber.
+    println!("cargo:rerun-if-changed=cpp/plumber.cpp");         // fixes leaks in bindgen.
     println!("cargo:rerun-if-changed=wrapper.h");
 
     // set build and source paths for surge, depending on build mode.
@@ -231,20 +231,26 @@ fn main() {
     );
     if var("CARGO_FEATURE_IN_SURGE_TREE").is_ok() { println!("cargo:rustc-link-lib=static=surge-common-binary"); }
 
-    realprint!("peeking into surge's build flags.");
+    realprint!("peeking into (and exporting) surge's build flags.");
     let comcom = bpath.clone() + "/build/compile_commands.json";    // "compile commands". comcom.
     let json = std::fs::read_to_string(&comcom).expect("failed to read comcom!");
     let coms: serde_json::Value = serde_json::from_str(&json).expect("failed to parse comcom!");
 
-    realprint!("gathering bridge materials.");
-    let mut bbuild = cc::Build::new();
-    bbuild
-        .warnings(false)
-        .cpp(true)
-        .std("c++20")
-        .include(spath.clone())
-	.flag("-fno-char8_t")               // read ahead. this has to go here too...
-        .file("cpp/bridge.cpp");
+    // get and use all the include paths from the configure.
+    let mut unique = HashSet::new();
+    for entry in coms.as_array().unwrap() {
+        if let Some(clist) = entry.get("command") {
+            shell_words::split(clist.as_str().unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.starts_with("-I") || x.starts_with("-DSURGE"))
+                .for_each(|x| { unique.insert(x); })
+        }
+    }
+    let mut unique: Vec<_> = unique.into_iter().collect();  // not sorting *will* crash the build.
+    unique.sort();                                          // like, at some point. hard to tell.
+    let prepath = PathBuf::from(var("CARGO_MANIFEST_DIR").unwrap()).display().to_string() + "/";
+    println!("cargo:bflags={}", unique.join(",") + ",-I" + &prepath + &spath);
 
     realprint!("searching for what the glue should bind.");
     let mut bindings = bindgen::Builder::default()
@@ -271,40 +277,36 @@ fn main() {
         .allowlist_item(".*idFor.*")        // fix for functions i need (unexported).
         .allowlist_item(".*Storage.*")      // fix for surge storage (most stuff).
         .allowlist_item(".*State.*")        // fix for surge storage (other stuff).
-        .emit_ir_graphviz("graph.dot")
         .parse_callbacks(Box::new(BindReporter));
 
-    // get and use all the include paths from the configure.
-    let mut unique = HashSet::new();
-    for entry in coms.as_array().unwrap() {
-        if let Some(clist) = entry.get("command") {
-            shell_words::split(clist.as_str().unwrap())
-                .unwrap()
-                .into_iter()
-                .filter(|x| x.starts_with("-I") || x.starts_with("-DSURGE"))
-                .for_each(|x| { unique.insert(x); })
-        }
-    }
+    realprint!("setting up the bindgen plumber.");
+    let mut bbuild = cc::Build::new();
+    bbuild
+        .warnings(false)
+        .cpp(true)
+        .std("c++20")
+        .include(spath.clone())
+        .flag("-fno-char8_t")               // read PRE-ahead. this has to go here too...
+        .file("cpp/plumber.cpp");           // (that means read up. this block moved.)
 
-    // not sorting *will* crash the build.
-    let mut tempvec: Vec<_> = unique.into_iter().collect();
-    tempvec.sort();
-    for flag in tempvec {
+    realprint!("applying surge powder to the glue and pipes.");
+    for flag in unique {
         fakeprint!("new flag: {}", flag);
         bbuild.flag(&flag);
         bindings = bindings.clone().clang_arg(&flag);   // is this not, like, bad or something?
     }
-
-    realprint!("bridge is being built. please hold.");
-    let out = bbuild.try_compile("bridge");
-    if let Err(e) = out { panic!("bridge burnt down while building.\n\n{}", e); }
-    println!("cargo:rustc-link-lib=static=bridge");
 
     realprint!("generating bindings. please hold so i can make the glue.");
     let storehere = PathBuf::from(var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings
         .generate().expect("unable to generate surge bindings")
         .write_to_file(storehere).expect("couldn't write bindings.");
+
+    realprint!("pipes are being assembled. please hold.");
+    let out = bbuild.try_compile("plumber");
+    if let Err(e) = out { panic!("pipes burst while building. -> \"{}\"", e); } // TODO: do this with other errors (the arrow thing).
+    println!("cargo:rustc-link-lib=static=plumber");
+
 
     realprint!("all done!");
 }

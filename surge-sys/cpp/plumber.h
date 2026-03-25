@@ -12,11 +12,6 @@
 typedef SurgeSynthesizer::ID ID;
 
 extern "C" {	// linkage?
-EXP	SurgeSynthesizer* create_engine(float sr);
-EXP	SurgePatch* create_patch();
-EXP	void destroy_engine(SurgeSynthesizer* surge);
-EXP	void destroy_patch(SurgePatch* patch);
-EXP	void destroy_parameter(Parameter* p);
 	// note 1.
 EXP	int getNumInputs(SurgeSynthesizer* surge);
 EXP	int getNumOutputs(SurgeSynthesizer* surge);

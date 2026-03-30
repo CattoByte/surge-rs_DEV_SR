@@ -107,7 +107,7 @@ fn pull_surge_from_clouds(dst: impl AsRef<Path>) {
             return;
         } else {
             realprint!("surge is down from the clouds, but it came down mangled.");
-            assert_eq!(dst.to_str().unwrap(), "sbmod/surge");   // just as safety.
+            assert_eq!(dst.to_str().unwrap(), "sbmod/surge/");  // just as safety.
             std::fs::remove_dir_all(dst).unwrap();
             realprint!("removed the mangled surge. poor thing.");
         }
